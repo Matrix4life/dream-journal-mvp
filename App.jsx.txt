@@ -1,0 +1,270 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
+
+function todaySessionIdLocal() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function loadSessions() {
+  try {
+    return JSON.parse(localStorage.getItem("dream_sessions_v1") || "{}");
+  } catch {
+    return {};
+  }
+}
+function saveSessions(sessions) {
+  localStorage.setItem("dream_sessions_v1", JSON.stringify(sessions));
+}
+function formatTime(d = new Date()) {
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function SpeechToText({ onResult, onError, onStop }) {
+  const [listening, setListening] = useState(false);
+  const recognitionRef = useRef(null);
+
+  const supported = useMemo(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    return !!SR;
+  }, []);
+
+  useEffect(() => {
+    if (!supported) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+
+    rec.onresult = (event) => {
+      let finalText = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const chunk = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalText += chunk;
+      }
+      if (finalText.trim()) onResult(finalText.trim());
+    };
+
+    rec.onerror = (e) => onError?.(e);
+    rec.onend = () => {
+      setListening(false);
+      onStop?.();
+    };
+
+    recognitionRef.current = rec;
+  }, [supported, onResult, onError, onStop]);
+
+  const start = () => {
+    if (!supported) return;
+    try {
+      recognitionRef.current.start();
+      setListening(true);
+    } catch (e) {
+      onError?.(e);
+    }
+  };
+  const stop = () => {
+    try {
+      recognitionRef.current.stop();
+    } catch (e) {
+      onError?.(e);
+    }
+  };
+
+  if (!supported) {
+    return <div className="hint">Voice-to-text isn’t supported here. Use “Type instead.”</div>;
+  }
+
+  return (
+    <div className="row">
+      {!listening ? (
+        <button className="btn primary" onClick={start}>🎙️ Start recording</button>
+      ) : (
+        <button className="btn danger" onClick={stop}>■ Stop</button>
+      )}
+      <div className="muted">{listening ? "I’m listening." : "Tap to speak."}</div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [mode, setMode] = useState("night");
+  const [sessions, setSessions] = useState(loadSessions());
+  const sessionId = useMemo(() => todaySessionIdLocal(), []);
+  const entries = sessions?.[sessionId]?.entries || [];
+
+  const [draft, setDraft] = useState("");
+  const [interpretation, setInterpretation] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [selectedEntryId, setSelectedEntryId] = useState(null);
+
+  useEffect(() => saveSessions(sessions), [sessions]);
+
+  const addEntry = (text, inputType) => {
+    const newEntry = {
+      entryId: crypto.randomUUID(),
+      timestamp: formatTime(new Date()),
+      inputType,
+      text
+    };
+
+    setSessions((prev) => {
+      const next = { ...prev };
+      const existing = next[sessionId] || { sleepSessionId: sessionId, entries: [] };
+      next[sessionId] = { ...existing, entries: [newEntry, ...existing.entries] };
+      return next;
+    });
+  };
+
+  const saveTyped = () => {
+    if (!draft.trim()) return;
+    addEntry(draft.trim(), "text");
+    setDraft("");
+  };
+
+  const interpretSingle = async (entry) => {
+    setBusy(true);
+    setInterpretation("");
+    try {
+      const res = await fetch(`${API_BASE}/interpret/single`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dreamText: entry.text,
+          metadata: { sessionId, timestamp: entry.timestamp, inputType: entry.inputType }
+        })
+      });
+      const data = await res.json();
+      setInterpretation(data.text || data.error || "No response.");
+    } catch {
+      setInterpretation("Couldn’t reach the server. Check VITE_API_BASE.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const interpretNight = async () => {
+    setBusy(true);
+    setInterpretation("");
+    try {
+      const res = await fetch(`${API_BASE}/interpret/night`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          entries: entries.map((e) => ({
+            timestamp: e.timestamp,
+            inputType: e.inputType,
+            text: e.text
+          })),
+          metadata: { entryCount: entries.length }
+        })
+      });
+      const data = await res.json();
+      setInterpretation(data.text || data.error || "No response.");
+    } catch {
+      setInterpretation("Couldn’t reach the server. Check VITE_API_BASE.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const selectedEntry = entries.find((e) => e.entryId === selectedEntryId) || null;
+
+  return (
+    <div className={`app ${mode}`}>
+      <header className="header">
+        <div className="title">Dream Journal</div>
+        <div className="seg">
+          <button className={`segBtn ${mode === "night" ? "active" : ""}`} onClick={() => setMode("night")}>
+            🌙 Night
+          </button>
+          <button className={`segBtn ${mode === "morning" ? "active" : ""}`} onClick={() => setMode("morning")}>
+            🌤 Morning
+          </button>
+        </div>
+      </header>
+
+      {mode === "night" ? (
+        <section className="card">
+          <h2>Just record. You can think about it later.</h2>
+          <p className="muted">Say whatever you remember. It doesn’t have to make sense.</p>
+
+          <SpeechToText onResult={(t) => addEntry(t, "voice")} />
+
+          <div className="divider">or</div>
+
+          <textarea
+            className="textarea"
+            placeholder="Type the dream… even fragments are fine."
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <div className="row">
+            <button className="btn primary" onClick={saveTyped}>Save</button>
+            <div className="muted">Auto-saves. No interpretation yet.</div>
+          </div>
+        </section>
+      ) : (
+        <section className="card">
+          <h2>Last night’s dreams</h2>
+          <p className="muted">Session: {sessionId} • You recorded {entries.length} entr{entries.length === 1 ? "y" : "ies"}.</p>
+
+          <div className="row wrap">
+            <button className="btn" disabled={entries.length === 0 || busy} onClick={interpretNight}>
+              Interpret all together
+            </button>
+            <button className="btn" disabled={!selectedEntry || busy} onClick={() => selectedEntry && interpretSingle(selectedEntry)}>
+              Interpret selected
+            </button>
+            <button className="btn ghost" onClick={() => setInterpretation("")}>Clear output</button>
+          </div>
+
+          <div className="list">
+            {entries.length === 0 ? (
+              <div className="hint">Nothing yet. Record a dream tonight.</div>
+            ) : (
+              entries.map((e) => (
+                <button
+                  key={e.entryId}
+                  className={`listItem ${selectedEntryId === e.entryId ? "selected" : ""}`}
+                  onClick={() => setSelectedEntryId(e.entryId)}
+                >
+                  <div className="listTop">
+                    <span className="pill">{e.inputType}</span>
+                    <span className="muted">{e.timestamp}</span>
+                  </div>
+                  <div className="listText">{e.text}</div>
+                </button>
+              ))
+            )}
+          </div>
+
+          <div className="output">
+            {busy ? (
+              <div className="hint">Reflecting…</div>
+            ) : interpretation ? (
+              <>
+                <div className="disclaimer">
+                  This is a reflection, not a verdict. Take what resonates. Leave the rest.
+                </div>
+                <pre className="pre">{interpretation}</pre>
+              </>
+            ) : (
+              <div className="hint">Pick one dream, or interpret the whole night.</div>
+            )}
+          </div>
+        </section>
+      )}
+
+      <footer className="footer">
+        <span className="muted">MVP • Local storage • Voice-to-text uses your browser</span>
+      </footer>
+    </div>
+  );
+}
